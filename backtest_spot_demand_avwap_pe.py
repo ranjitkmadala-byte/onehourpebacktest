@@ -521,7 +521,23 @@ def main():
         with c.cursor() as x:
             x.execute(qcount,(START,END)); s=dict(x.fetchone())
 
-    summary={**s,"failed":failed,
+    safe_s = {}
+    for k, v in s.items():
+        if v is None:
+            safe_s[k] = None
+        elif isinstance(v, bool):
+            safe_s[k] = v
+        elif isinstance(v, int):
+            safe_s[k] = v
+        elif isinstance(v, float):
+            safe_s[k] = v
+        else:
+            try:
+                safe_s[k] = float(v)
+            except (TypeError, ValueError):
+                safe_s[k] = str(v)
+
+    summary={**safe_s,"failed":failed,
       "mirror_rule":{
         "breakdown":"09:15-10:15 spot close below Strong Demand Low",
         "avwap_anchor_context":"09:15 3-minute HIGH; AVWAP accumulated from 09:15",

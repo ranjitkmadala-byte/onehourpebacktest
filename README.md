@@ -26,3 +26,9 @@ Writes:
 
 Uses the same historical study window by default: 2026-08-26 through 2026-09-11.
 Universe is taken from distinct symbols already present in public.spot_supply_1h_backtest_hourly.
+
+
+## JSON serialization fix
+PostgreSQL result values are converted to JSON-safe Python types before writing
+the summary Jsonb row. This prevents Decimal serialization errors.
+The detail-table upsert logic is unchanged, so rerunning is safe.
