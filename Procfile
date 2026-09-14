@@ -1,1 +1,1 @@
-worker: python backtest_spot_demand_avwap_pe.py
+worker: python backtest_weak_demand_5m_avwap_pe.py

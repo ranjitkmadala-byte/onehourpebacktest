@@ -1,34 +1,45 @@
-# Strong Demand breakdown -> AVWAP -> ATM PE backtest
+# Weak Demand 5m Break -> Anytime AVWAP Retrace -> ATM PE -> Strong Demand Target
 
-Mirror of the Strong Supply bullish study.
+This is the revised version with the 10:15 / 10:45 timing logic removed.
 
-Rules:
-1. SPOT 09:15-10:15 completed 1-hour candle closes below Strong Demand Low.
-2. AVWAP accumulates from 09:15. The 09:15 3-minute HIGH is stored as the bearish anchor context.
-3. After 10:15, wait for a 3-minute bar HIGH to touch/cross AVWAP.
-4. Entry setup occurs on the first LATER completed 3-minute candle closing BELOW AVWAP, no later than 12:15.
-5. Select nearest-expiry ATM CE + PE at the spot entry.
-6. Bearish option confirmation score:
-   - PE premium up = 1
-   - PE OI down = 1
-   - CE premium down = 1
-   - CE OI up = 1
-7. Exact option entry = ATM PE when score first reaches >=3 within 15 minutes.
-8. Spot target = -0.5% from the original AVWAP spot entry.
-9. Spot stop = +0.5% from the original AVWAP spot entry.
-10. Exit 100% of ATM PE at whichever spot level occurs first; if neither, EOD.
+Zone source
+-----------
+Both Weak Demand and Strong Demand are mirrored from the supplied Pine daily-zone formulas.
 
-The target/stop outcome scan begins only after the ATM PE option-entry confirmation, so the result is executable without look-ahead.
+Weak Demand:
+- dist_weak = sigma / (2 * sqrt(2))
+- ww = round(sigma / (4 * phi))
+- weak_demand_low  = round(P - dist_weak - ww/2)
+- weak_demand_high = round(P - dist_weak + ww/2)
+
+Strong Demand:
+- dist_strong = sigma
+- ws = round(sigma / 4)
+- strong_demand_low  = round(P - sigma - ws/2)
+- strong_demand_high = round(P - sigma + ws/2)
+
+Revised backtest rule
+---------------------
+1. The completed 09:15-09:20 SPOT 5-minute candle must CLOSE below Weak Demand Low.
+2. From 09:20 onward, price may retrace to AVWAP at ANY TIME.
+3. Retrace = a completed 3-minute candle high touches/crosses AVWAP.
+4. Bearish spot setup = first LATER completed 3-minute candle closes below AVWAP.
+5. Setup must occur by ENTRY_CUTOFF (default 12:15, configurable).
+6. Select nearest-expiry ATM CE + PE.
+7. Bearish option score:
+   - PE premium up
+   - PE OI down
+   - CE premium down
+   - CE OI up
+8. Require score EXACTLY 3 within 15 minutes after the AVWAP spot entry.
+9. No 10:45-11:15 option time filter.
+10. Require ATM PE entry premium >= Rs 10.
+11. TARGET = Daily Strong Demand HIGH boundary (first boundary reached from above).
+12. STOP = +0.5% from the AVWAP spot entry.
+13. Exit 100% ATM PE when Strong Demand target or stop occurs first; neither -> EOD.
+
+Default study window: 2026-08-26 through 2026-09-11.
 
 Writes:
-- public.spot_demand_1015_avwap_pe_backtest
-- public.spot_demand_1015_avwap_pe_summary
-
-Uses the same historical study window by default: 2026-08-26 through 2026-09-11.
-Universe is taken from distinct symbols already present in public.spot_supply_1h_backtest_hourly.
-
-
-## JSON serialization fix
-PostgreSQL result values are converted to JSON-safe Python types before writing
-the summary Jsonb row. This prevents Decimal serialization errors.
-The detail-table upsert logic is unchanged, so rerunning is safe.
+- public.weak_demand_5m_avwap_pe_backtest
+- public.weak_demand_5m_avwap_pe_summary
