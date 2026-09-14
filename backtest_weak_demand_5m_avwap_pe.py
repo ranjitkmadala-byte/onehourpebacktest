@@ -65,7 +65,7 @@ def get_json(url, params=None, tries=5):
     raise RuntimeError(str(last))
 
 DDL = """
-CREATE TABLE IF NOT EXISTS public.first5_literal_zone_break_backtest (
+CREATE TABLE IF NOT EXISTS public.first5_close_below_lower_zone_backtest (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS public.first5_literal_zone_break_backtest (
     PRIMARY KEY(study_start,study_end,trading_date,symbol)
 );
 
-CREATE TABLE IF NOT EXISTS public.first5_literal_zone_break_summary (
+CREATE TABLE IF NOT EXISTS public.first5_close_below_lower_zone_summary (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS public.first5_literal_zone_break_summary (
 """
 
 UPSERT = """
-INSERT INTO public.first5_literal_zone_break_backtest (
+INSERT INTO public.first5_close_below_lower_zone_backtest (
  study_start,study_end,run_id,trading_date,symbol,spot_instrument_key,
  day_open,atr20,prev_close,sigma,weak_demand_low,weak_demand_high,strong_demand_low,strong_demand_high,weak_supply_low,weak_supply_high,strong_supply_low,strong_supply_high,start_zone,end_zone,zones_traversed,previous_zone_name,previous_zone_level,next_zone_name,next_zone_level,
  first5_open,first5_high,first5_low,first5_close,weak_demand_broken_5m,break_pct,
@@ -293,21 +293,48 @@ def all_zones(day_open,atr,prev_close):
       "SS":(round(P+ds-ws/2),round(P+ds+ws/2))
     }
 
-def literal_transition(open_price,low_price,z):
-    order=["SS","WS","WD","SD"]
-    # Start at highest actual zone whose lower boundary is at/below the opening price.
-    si=None
-    for i,n in enumerate(order):
-        if open_price>=z[n][0]:
-            si=i; break
-    if si is None:return None
-    ei=si
-    # End at deepest lower zone whose upper boundary was actually reached by the low.
-    for j in range(si+1,len(order)):
-        if low_price<=z[order[j]][1]:
-            ei=j
-    if ei<=si:return None
-    return order,si,ei
+def literal_transition(open_price, close_price, zones):
+    """
+    Strict close-confirmed downward zone transition.
+
+    Daily zones are ordered:
+        SS -> WS -> WD -> SD
+
+    Qualification:
+      - identify the starting zone from the 09:15 OPEN
+      - the 09:20 CLOSE must be BELOW the LOW boundary of at least one lower zone
+      - the deepest lower zone fully broken by the CLOSE becomes end_zone
+
+    Examples:
+      SS -> WS qualifies only if 09:20 close < WS low
+      WS -> WD qualifies only if 09:20 close < WD low
+      WD -> SD qualifies only if 09:20 close < SD low
+
+    This is intentionally stricter than using the candle low.
+    """
+    order = ["SS", "WS", "WD", "SD"]
+
+    start_idx = None
+    for i, name in enumerate(order):
+        lo, hi = zones[name]
+        if open_price >= lo:
+            start_idx = i
+            break
+
+    if start_idx is None:
+        return None
+
+    end_idx = start_idx
+
+    for j in range(start_idx + 1, len(order)):
+        lo, hi = zones[order[j]]
+        if close_price < lo:
+            end_idx = j
+
+    if end_idx <= start_idx:
+        return None
+
+    return order, start_idx, end_idx
 
 
 def build_3m(rows):
@@ -440,7 +467,7 @@ def process(sym,key,day):
     if not f:return z
     O=f[0]["open"]; H=max(x["high"] for x in f); L=min(x["low"] for x in f); C=f[-1]["close"]
     z.update(first5_open=O,first5_high=H,first5_low=L,first5_close=C)
-    m=literal_transition(O,L,Z)
+    m=literal_transition(O,C,Z)
     if not m:
         z.update(zones_traversed=0,weak_demand_broken_5m=False); return z
     order,si,ei=m; sz=order[si]; ez=order[ei]
@@ -512,7 +539,7 @@ def main():
       ROUND(AVG(pe_return_pct) FILTER(WHERE final_trade),3) avg_return_pct,
       ROUND(PERCENTILE_CONT(.5) WITHIN GROUP(ORDER BY pe_return_pct)
             FILTER(WHERE final_trade)::numeric,3) median_return_pct
-    FROM public.first5_literal_zone_break_backtest
+    FROM public.first5_close_below_lower_zone_backtest
     WHERE study_start=%s AND study_end=%s
     """
     with db() as c:
@@ -530,14 +557,14 @@ def main():
     summary={**safe,"failed":failed,
       "rule":{
         "zone":"Daily Weak Demand from supplied Pine source",
-        "signal":"literal first-5m zone-boundary transition; no nearest-zone assignment",
+        "signal":"09:20 CLOSE must finish below the LOW boundary of the lower zone; no nearest-zone assignment",
         "entry":"LOW of completed 09:15-09:20 candle",
         "target":"HIGH boundary of next zone below entry",
         "stop":"LOW boundary of previous zone above entry",
         "exit":"target/stop whichever occurs first; neither -> EOD"
       }}
 
-    qs="""INSERT INTO public.first5_literal_zone_break_summary
+    qs="""INSERT INTO public.first5_close_below_lower_zone_summary
       (study_start,study_end,run_id,symbols,weak_demand_breaks,spot_entries,score3_entries,
        final_trades,target_first,stop_first,neither,failed,summary)
       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
