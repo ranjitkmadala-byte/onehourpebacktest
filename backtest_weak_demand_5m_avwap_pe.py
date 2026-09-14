@@ -65,7 +65,7 @@ def get_json(url, params=None, tries=5):
     raise RuntimeError(str(last))
 
 DDL = """
-CREATE TABLE IF NOT EXISTS public.first5_one_or_more_zone_traversal_backtest (
+CREATE TABLE IF NOT EXISTS public.first5_literal_zone_break_backtest (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS public.first5_one_or_more_zone_traversal_backtest (
     PRIMARY KEY(study_start,study_end,trading_date,symbol)
 );
 
-CREATE TABLE IF NOT EXISTS public.first5_one_or_more_zone_traversal_summary (
+CREATE TABLE IF NOT EXISTS public.first5_literal_zone_break_summary (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -169,7 +169,7 @@ CREATE TABLE IF NOT EXISTS public.first5_one_or_more_zone_traversal_summary (
 """
 
 UPSERT = """
-INSERT INTO public.first5_one_or_more_zone_traversal_backtest (
+INSERT INTO public.first5_literal_zone_break_backtest (
  study_start,study_end,run_id,trading_date,symbol,spot_instrument_key,
  day_open,atr20,prev_close,sigma,weak_demand_low,weak_demand_high,strong_demand_low,strong_demand_high,weak_supply_low,weak_supply_high,strong_supply_low,strong_supply_high,start_zone,end_zone,zones_traversed,previous_zone_name,previous_zone_level,next_zone_name,next_zone_level,
  first5_open,first5_high,first5_low,first5_close,weak_demand_broken_5m,break_pct,
@@ -293,11 +293,21 @@ def all_zones(day_open,atr,prev_close):
       "SS":(round(P+ds-ws/2),round(P+ds+ws/2))
     }
 
-def nearest_zone(price,z):
-    def d(b):
-        lo,hi=b
-        return lo-price if price<lo else price-hi if price>hi else 0
-    return min(z,key=lambda n:abs(d(z[n])))
+def literal_transition(open_price,low_price,z):
+    order=["SS","WS","WD","SD"]
+    # Start at highest actual zone whose lower boundary is at/below the opening price.
+    si=None
+    for i,n in enumerate(order):
+        if open_price>=z[n][0]:
+            si=i; break
+    if si is None:return None
+    ei=si
+    # End at deepest lower zone whose upper boundary was actually reached by the low.
+    for j in range(si+1,len(order)):
+        if low_price<=z[order[j]][1]:
+            ei=j
+    if ei<=si:return None
+    return order,si,ei
 
 
 def build_3m(rows):
@@ -430,18 +440,20 @@ def process(sym,key,day):
     if not f:return z
     O=f[0]["open"]; H=max(x["high"] for x in f); L=min(x["low"] for x in f); C=f[-1]["close"]
     z.update(first5_open=O,first5_high=H,first5_low=L,first5_close=C)
-    order=["SS","WS","WD","SD"]
-    sz=nearest_zone(O,Z); ez=nearest_zone(L,Z); si=order.index(sz); ei=order.index(ez)
-    n=max(0,ei-si); z.update(start_zone=sz,end_zone=ez,zones_traversed=n,weak_demand_broken_5m=n>=1)
-    if n<1 or ei>=3:return z
-    nxt=order[ei+1]; prv=order[ei-1] if ei>0 else sz
+    m=literal_transition(O,L,Z)
+    if not m:
+        z.update(zones_traversed=0,weak_demand_broken_5m=False); return z
+    order,si,ei=m; sz=order[si]; ez=order[ei]
+    z.update(start_zone=sz,end_zone=ez,zones_traversed=ei-si,weak_demand_broken_5m=True)
+    if ei>=len(order)-1:return z
+    nxt=order[ei+1]; prv=order[ei-1]
     target=float(Z[nxt][1]); stop=float(Z[prv][0]); entry=L
     if not(target<entry<stop):return z
+    et=datetime.combine(day,FIRST5_END,IST)
     z.update(previous_zone_name=prv,previous_zone_level=stop,next_zone_name=nxt,next_zone_level=target,
-      spot_entry_found=True,spot_entry_time=datetime.combine(day,FIRST5_END,IST),spot_entry_price=entry,
-      spot_target_price=target,spot_stop_price=stop,final_trade=True,time_filter_pass=True,premium_filter_pass=True)
-    post=[x for x in market if x["ts"]>=datetime.combine(day,FIRST5_END,IST)]
-    out="NEITHER"; ot=None; ex=None
+      spot_entry_found=True,spot_entry_time=et,spot_entry_price=entry,spot_target_price=target,
+      spot_stop_price=stop,final_trade=True,time_filter_pass=True,premium_filter_pass=True)
+    post=[x for x in market if x["ts"]>=et]; out="NEITHER"; ot=None; ex=None
     for x in post:
       ht=x["low"]<=target; hs=x["high"]>=stop
       if ht and hs:out="AMBIGUOUS_SAME_1M_BAR";ot=x["ts"]+timedelta(minutes=1);ex=x["close"];break
@@ -500,7 +512,7 @@ def main():
       ROUND(AVG(pe_return_pct) FILTER(WHERE final_trade),3) avg_return_pct,
       ROUND(PERCENTILE_CONT(.5) WITHIN GROUP(ORDER BY pe_return_pct)
             FILTER(WHERE final_trade)::numeric,3) median_return_pct
-    FROM public.first5_one_or_more_zone_traversal_backtest
+    FROM public.first5_literal_zone_break_backtest
     WHERE study_start=%s AND study_end=%s
     """
     with db() as c:
@@ -518,14 +530,14 @@ def main():
     summary={**safe,"failed":failed,
       "rule":{
         "zone":"Daily Weak Demand from supplied Pine source",
-        "signal":"09:15-09:20 candle falls downward across at least one daily zone step",
+        "signal":"literal first-5m zone-boundary transition; no nearest-zone assignment",
         "entry":"LOW of completed 09:15-09:20 candle",
         "target":"HIGH boundary of next zone below entry",
         "stop":"LOW boundary of previous zone above entry",
         "exit":"target/stop whichever occurs first; neither -> EOD"
       }}
 
-    qs="""INSERT INTO public.first5_one_or_more_zone_traversal_summary
+    qs="""INSERT INTO public.first5_literal_zone_break_summary
       (study_start,study_end,run_id,symbols,weak_demand_breaks,spot_entries,score3_entries,
        final_trades,target_first,stop_first,neither,failed,summary)
       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
