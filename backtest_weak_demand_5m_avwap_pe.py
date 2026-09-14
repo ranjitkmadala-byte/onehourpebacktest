@@ -65,7 +65,7 @@ def get_json(url, params=None, tries=5):
     raise RuntimeError(str(last))
 
 DDL = """
-CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_backtest (
+CREATE TABLE IF NOT EXISTS public.first5_one_or_more_zone_traversal_backtest (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -82,6 +82,17 @@ CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_backtest (
     weak_demand_high NUMERIC,
     strong_demand_low NUMERIC,
     strong_demand_high NUMERIC,
+    weak_supply_low NUMERIC,
+    weak_supply_high NUMERIC,
+    strong_supply_low NUMERIC,
+    strong_supply_high NUMERIC,
+    start_zone TEXT,
+    end_zone TEXT,
+    zones_traversed INTEGER,
+    previous_zone_name TEXT,
+    previous_zone_level NUMERIC,
+    next_zone_name TEXT,
+    next_zone_level NUMERIC,
 
     first5_open NUMERIC,
     first5_high NUMERIC,
@@ -138,7 +149,7 @@ CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_backtest (
     PRIMARY KEY(study_start,study_end,trading_date,symbol)
 );
 
-CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_summary (
+CREATE TABLE IF NOT EXISTS public.first5_one_or_more_zone_traversal_summary (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -158,9 +169,9 @@ CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_summary (
 """
 
 UPSERT = """
-INSERT INTO public.weak_demand_5m_0920_low_day_high_backtest (
+INSERT INTO public.first5_one_or_more_zone_traversal_backtest (
  study_start,study_end,run_id,trading_date,symbol,spot_instrument_key,
- day_open,atr20,prev_close,sigma,weak_demand_low,weak_demand_high,strong_demand_low,strong_demand_high,
+ day_open,atr20,prev_close,sigma,weak_demand_low,weak_demand_high,strong_demand_low,strong_demand_high,weak_supply_low,weak_supply_high,strong_supply_low,strong_supply_high,start_zone,end_zone,zones_traversed,previous_zone_name,previous_zone_level,next_zone_name,next_zone_level,
  first5_open,first5_high,first5_low,first5_close,weak_demand_broken_5m,break_pct,
  anchor_0915_high,avwap_at_1015,
  retrace_found,retrace_time,retrace_high,avwap_at_retrace,
@@ -173,7 +184,7 @@ INSERT INTO public.weak_demand_5m_0920_low_day_high_backtest (
  data_status,error_message
 ) VALUES (
  %(study_start)s,%(study_end)s,%(run_id)s,%(trading_date)s,%(symbol)s,%(spot_instrument_key)s,
- %(day_open)s,%(atr20)s,%(prev_close)s,%(sigma)s,%(weak_demand_low)s,%(weak_demand_high)s,%(strong_demand_low)s,%(strong_demand_high)s,
+ %(day_open)s,%(atr20)s,%(prev_close)s,%(sigma)s,%(weak_demand_low)s,%(weak_demand_high)s,%(strong_demand_low)s,%(strong_demand_high)s,%(weak_supply_low)s,%(weak_supply_high)s,%(strong_supply_low)s,%(strong_supply_high)s,%(start_zone)s,%(end_zone)s,%(zones_traversed)s,%(previous_zone_name)s,%(previous_zone_level)s,%(next_zone_name)s,%(next_zone_level)s,
  %(first5_open)s,%(first5_high)s,%(first5_low)s,%(first5_close)s,%(weak_demand_broken_5m)s,%(break_pct)s,
  %(anchor_0915_high)s,%(avwap_at_1015)s,
  %(retrace_found)s,%(retrace_time)s,%(retrace_high)s,%(avwap_at_retrace)s,
@@ -189,6 +200,7 @@ ON CONFLICT(study_start,study_end,trading_date,symbol) DO UPDATE SET
  run_id=EXCLUDED.run_id,day_open=EXCLUDED.day_open,atr20=EXCLUDED.atr20,prev_close=EXCLUDED.prev_close,
  sigma=EXCLUDED.sigma,weak_demand_low=EXCLUDED.weak_demand_low,weak_demand_high=EXCLUDED.weak_demand_high,
  strong_demand_low=EXCLUDED.strong_demand_low,strong_demand_high=EXCLUDED.strong_demand_high,
+ weak_supply_low=EXCLUDED.weak_supply_low,weak_supply_high=EXCLUDED.weak_supply_high,strong_supply_low=EXCLUDED.strong_supply_low,strong_supply_high=EXCLUDED.strong_supply_high,start_zone=EXCLUDED.start_zone,end_zone=EXCLUDED.end_zone,zones_traversed=EXCLUDED.zones_traversed,previous_zone_name=EXCLUDED.previous_zone_name,previous_zone_level=EXCLUDED.previous_zone_level,next_zone_name=EXCLUDED.next_zone_name,next_zone_level=EXCLUDED.next_zone_level,
  first5_open=EXCLUDED.first5_open,first5_high=EXCLUDED.first5_high,first5_low=EXCLUDED.first5_low,
  first5_close=EXCLUDED.first5_close,weak_demand_broken_5m=EXCLUDED.weak_demand_broken_5m,break_pct=EXCLUDED.break_pct,
  anchor_0915_high=EXCLUDED.anchor_0915_high,avwap_at_1015=EXCLUDED.avwap_at_1015,
@@ -269,25 +281,24 @@ def wilder_atr(daily, period=20):
         atr=((atr*(period-1))+tr)/period
     return atr
 
-def demand_zones(day_open, atr, prev_close):
-    atr_ann_pct = atr / prev_close * SQRT252 * 100
-    effvol = D_SLOPE * atr_ann_pct + D_INTERCEPT
-    p = round(day_open)
-    sigma = p * effvol / (100.0 * SQRT252)
+def all_zones(day_open,atr,prev_close):
+    atr_ann_pct=atr/prev_close*SQRT252*100
+    effvol=D_SLOPE*atr_ann_pct+D_INTERCEPT
+    P=round(day_open); sigma=P*effvol/(100*SQRT252)
+    ds=sigma; dw=sigma/(2*SQRT2); ws=round(sigma/4); ww=round(sigma/(4*PHI))
+    return sigma, {
+      "SD":(round(P-ds-ws/2),round(P-ds+ws/2)),
+      "WD":(round(P-dw-ww/2),round(P-dw+ww/2)),
+      "WS":(round(P+dw-ww/2),round(P+dw+ww/2)),
+      "SS":(round(P+ds-ws/2),round(P+ds+ws/2))
+    }
 
-    # Pine Daily Weak Demand
-    dist_weak = sigma / (2.0 * SQRT2)
-    ww = round(sigma / (4.0 * PHI))
-    weak_low = round(p - dist_weak - ww/2.0)
-    weak_high = round(p - dist_weak + ww/2.0)
+def nearest_zone(price,z):
+    def d(b):
+        lo,hi=b
+        return lo-price if price<lo else price-hi if price>hi else 0
+    return min(z,key=lambda n:abs(d(z[n])))
 
-    # Pine Daily Strong Demand
-    dist_strong = sigma
-    ws = round(sigma / 4.0)
-    strong_low = round(p - dist_strong - ws/2.0)
-    strong_high = round(p - dist_strong + ws/2.0)
-
-    return sigma, weak_low, weak_high, strong_low, strong_high
 
 def build_3m(rows):
     buckets={}
@@ -390,7 +401,7 @@ def nearest_row(rows, ts):
 def blank(sym,key,day):
     return dict(
       study_start=START,study_end=END,run_id=RUN_ID,trading_date=day,symbol=sym,spot_instrument_key=key,
-      day_open=None,atr20=None,prev_close=None,sigma=None,weak_demand_low=None,weak_demand_high=None,strong_demand_low=None,strong_demand_high=None,
+      day_open=None,atr20=None,prev_close=None,sigma=None,weak_demand_low=None,weak_demand_high=None,strong_demand_low=None,strong_demand_high=None,weak_supply_low=None,weak_supply_high=None,strong_supply_low=None,strong_supply_high=None,start_zone=None,end_zone=None,zones_traversed=None,previous_zone_name=None,previous_zone_level=None,next_zone_name=None,next_zone_level=None,
       first5_open=None,first5_high=None,first5_low=None,first5_close=None,weak_demand_broken_5m=False,break_pct=None,
       anchor_0915_high=None,avwap_at_1015=None,retrace_found=False,retrace_time=None,retrace_high=None,avwap_at_retrace=None,
       spot_entry_found=False,spot_entry_time=None,spot_entry_price=None,avwap_at_entry=None,
@@ -405,100 +416,43 @@ def process(sym,key,day):
     z=blank(sym,key,day)
     spot=fetch_1m(key,day)
     market=[r for r in spot if dtime(9,15)<=r["ts"].time().replace(tzinfo=None)<dtime(15,30)]
-    if not market:
-        raise ValueError("no spot 1m history")
-
-    daily=fetch_daily(key,day-timedelta(days=1))
-    prev=[r for r in daily if r["day"]<day]
-    if len(prev)<ATR_PERIOD+1:
-        raise ValueError("insufficient daily history")
-
-    atr=wilder_atr(prev,ATR_PERIOD)
-    prev_close=prev[-1]["close"]
-    day_open=market[0]["open"]
-    sigma,wdl,wdh,sdl,sdh=demand_zones(day_open,atr,prev_close)
-    z.update(day_open=day_open,atr20=atr,prev_close=prev_close,sigma=sigma,
-             weak_demand_low=wdl,weak_demand_high=wdh,
-             strong_demand_low=sdl,strong_demand_high=sdh)
-
-    first5=[r for r in market if dtime(9,15)<=r["ts"].time().replace(tzinfo=None)<FIRST5_END]
-    if not first5:
-        return z
-
-    f5o=first5[0]["open"]
-    f5h=max(r["high"] for r in first5)
-    f5l=min(r["low"] for r in first5)
-    f5c=first5[-1]["close"]
-    broken=f5c < wdl
-
-    z.update(first5_open=f5o,first5_high=f5h,first5_low=f5l,first5_close=f5c,
-             weak_demand_broken_5m=broken,
-             break_pct=(f5c/wdl-1)*100 if wdl else None)
-
-    if not broken:
-        return z
-
-    entry_time=datetime.combine(day,FIRST5_END,IST)
-
-    # User rule: once the completed 09:15-09:20 candle closes below Weak Demand,
-    # use that same 5-minute candle's LOW as the short entry reference.
-    entry_price=f5l
-    target=entry_price*(1-TARGET_PCT/100.0)
-
-    # Stop = session/day high known at the 09:20 signal time.
-    # Since the trade is entered immediately after the completed 09:15-09:20 candle,
-    # this is the high of that completed opening 5-minute candle (no future leakage).
-    stop=f5h
-
-    z.update(
-        spot_entry_found=True,
-        spot_entry_time=entry_time,
-        spot_entry_price=entry_price,
-        spot_target_price=target,
-        spot_stop_price=stop,
-        final_trade=True,
-        time_filter_pass=True,
-        premium_filter_pass=True,
-    )
-
-    post=[r for r in market if r["ts"]>=entry_time]
-    outcome="NEITHER"
-    outcome_time=None
-    exit_px=None
-
-    for r in post:
-        hit_t=r["low"]<=target
-        hit_s=r["high"]>=stop
-        if hit_t and hit_s:
-            outcome="AMBIGUOUS_SAME_1M_BAR"
-            outcome_time=r["ts"]+timedelta(minutes=1)
-            exit_px=r["close"]
-            break
-        if hit_t:
-            outcome="TARGET_FIRST"
-            outcome_time=r["ts"]+timedelta(minutes=1)
-            exit_px=target
-            break
-        if hit_s:
-            outcome="STOP_FIRST"
-            outcome_time=r["ts"]+timedelta(minutes=1)
-            exit_px=stop
-            break
-
-    eod=post[-1]["close"] if post else entry_price
-    if outcome=="NEITHER":
-        exit_px=eod
-
-    z["first_outcome"]=outcome
-    z["outcome_time"]=outcome_time
-
-    # Reuse return fields for short-SPOT strategy metrics in this study.
-    z["pe_entry_price"]=entry_price
-    z["pe_exit_price"]=exit_px
-    z["pe_return_pct"]=((entry_price-exit_px)/entry_price)*100 if exit_px is not None else None
-    z["pe_eod_price"]=eod
-    z["pe_eod_return_pct"]=((entry_price-eod)/entry_price)*100
+    if not market: raise ValueError("no spot history")
+    daily=fetch_daily(key,day-timedelta(days=1)); prev=[r for r in daily if r["day"]<day]
+    if len(prev)<ATR_PERIOD+1: raise ValueError("insufficient ATR history")
+    atr=wilder_atr(prev,ATR_PERIOD); pc=prev[-1]["close"]; op=market[0]["open"]
+    sigma,Z=all_zones(op,atr,pc)
+    z.update(day_open=op,atr20=atr,prev_close=pc,sigma=sigma,
+      strong_demand_low=Z["SD"][0],strong_demand_high=Z["SD"][1],
+      weak_demand_low=Z["WD"][0],weak_demand_high=Z["WD"][1],
+      weak_supply_low=Z["WS"][0],weak_supply_high=Z["WS"][1],
+      strong_supply_low=Z["SS"][0],strong_supply_high=Z["SS"][1])
+    f=[r for r in market if dtime(9,15)<=r["ts"].time().replace(tzinfo=None)<FIRST5_END]
+    if not f:return z
+    O=f[0]["open"]; H=max(x["high"] for x in f); L=min(x["low"] for x in f); C=f[-1]["close"]
+    z.update(first5_open=O,first5_high=H,first5_low=L,first5_close=C)
+    order=["SS","WS","WD","SD"]
+    sz=nearest_zone(O,Z); ez=nearest_zone(L,Z); si=order.index(sz); ei=order.index(ez)
+    n=max(0,ei-si); z.update(start_zone=sz,end_zone=ez,zones_traversed=n,weak_demand_broken_5m=n>=1)
+    if n<1 or ei>=3:return z
+    nxt=order[ei+1]; prv=order[ei-1] if ei>0 else sz
+    target=float(Z[nxt][1]); stop=float(Z[prv][0]); entry=L
+    if not(target<entry<stop):return z
+    z.update(previous_zone_name=prv,previous_zone_level=stop,next_zone_name=nxt,next_zone_level=target,
+      spot_entry_found=True,spot_entry_time=datetime.combine(day,FIRST5_END,IST),spot_entry_price=entry,
+      spot_target_price=target,spot_stop_price=stop,final_trade=True,time_filter_pass=True,premium_filter_pass=True)
+    post=[x for x in market if x["ts"]>=datetime.combine(day,FIRST5_END,IST)]
+    out="NEITHER"; ot=None; ex=None
+    for x in post:
+      ht=x["low"]<=target; hs=x["high"]>=stop
+      if ht and hs:out="AMBIGUOUS_SAME_1M_BAR";ot=x["ts"]+timedelta(minutes=1);ex=x["close"];break
+      if ht:out="TARGET_FIRST";ot=x["ts"]+timedelta(minutes=1);ex=target;break
+      if hs:out="STOP_FIRST";ot=x["ts"]+timedelta(minutes=1);ex=stop;break
+    eod=post[-1]["close"] if post else entry
+    if out=="NEITHER":ex=eod
+    z.update(first_outcome=out,outcome_time=ot,pe_entry_price=entry,pe_exit_price=ex,
+      pe_return_pct=(entry-ex)/entry*100,pe_eod_price=eod,pe_eod_return_pct=(entry-eod)/entry*100)
     return z
+
 
 def main():
     if not DB or not TOKEN:
@@ -546,7 +500,7 @@ def main():
       ROUND(AVG(pe_return_pct) FILTER(WHERE final_trade),3) avg_return_pct,
       ROUND(PERCENTILE_CONT(.5) WITHIN GROUP(ORDER BY pe_return_pct)
             FILTER(WHERE final_trade)::numeric,3) median_return_pct
-    FROM public.weak_demand_5m_0920_low_day_high_backtest
+    FROM public.first5_one_or_more_zone_traversal_backtest
     WHERE study_start=%s AND study_end=%s
     """
     with db() as c:
@@ -564,14 +518,14 @@ def main():
     summary={**safe,"failed":failed,
       "rule":{
         "zone":"Daily Weak Demand from supplied Pine source",
-        "signal":"09:15-09:20 SPOT candle closes below Weak Demand Low",
-        "entry":"short entry at LOW of completed 09:15-09:20 candle",
-        "target":"-0.5% from entry",
-        "stop":"day/session high known at 09:20 = high of completed 09:15-09:20 candle",
+        "signal":"09:15-09:20 candle falls downward across at least one daily zone step",
+        "entry":"LOW of completed 09:15-09:20 candle",
+        "target":"HIGH boundary of next zone below entry",
+        "stop":"LOW boundary of previous zone above entry",
         "exit":"target/stop whichever occurs first; neither -> EOD"
       }}
 
-    qs="""INSERT INTO public.weak_demand_5m_0920_low_day_high_summary
+    qs="""INSERT INTO public.first5_one_or_more_zone_traversal_summary
       (study_start,study_end,run_id,symbols,weak_demand_breaks,spot_entries,score3_entries,
        final_trades,target_first,stop_first,neither,failed,summary)
       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)

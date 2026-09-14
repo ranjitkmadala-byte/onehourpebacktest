@@ -1,25 +1,32 @@
-# Weak Demand 09:20 Low Entry — 0.5% Target / Day-High Stop
+# First 5-Minute One-or-More Zone Traversal Backtest
 
-Signal:
-- Completed 09:15-09:20 SPOT candle CLOSES below Daily Weak Demand Low.
+Daily zone order:
+Strong Supply (SS) -> Weak Supply (WS) -> Weak Demand (WD) -> Strong Demand (SD)
+
+Qualification:
+The 09:15-09:20 SPOT candle must fall downward by AT LEAST ONE zone step.
+
+Now qualifying examples:
+- SS -> WS
+- WS -> WD
+- WD -> SD
+- SS -> WD
+- WS -> SD
+- SS -> SD
 
 Entry:
-- Short at LOW of the completed 09:15-09:20 candle.
+- LOW of the completed 09:15-09:20 candle.
 
 Target:
-- 0.5% below entry.
+- HIGH boundary of the next zone below the entry/end-zone.
 
 Stop:
-- Day/session high known at the moment of entry.
-- At 09:20, that is the HIGH of the completed 09:15-09:20 opening candle.
-- The backtest does NOT use the eventual full-day high because that would introduce future leakage.
+- LOW boundary of the previous zone above the entry/end-zone.
 
-Outcome:
-- Evaluate only after the 09:20 signal candle is complete.
-- Target first / stop first.
-- Same 1-minute target+stop occurrence = AMBIGUOUS_SAME_1M_BAR.
-- Neither = EOD.
+No AVWAP.
+No options.
+No fixed-percentage target/stop.
 
-Output:
-- public.weak_demand_5m_0920_low_day_high_backtest
-- public.weak_demand_5m_0920_low_day_high_summary
+Output tables:
+- public.first5_one_or_more_zone_traversal_backtest
+- public.first5_one_or_more_zone_traversal_summary
