@@ -65,7 +65,7 @@ def get_json(url, params=None, tries=5):
     raise RuntimeError(str(last))
 
 DDL = """
-CREATE TABLE IF NOT EXISTS public.weak_demand_5m_avwap_pe_backtest (
+CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_backtest (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS public.weak_demand_5m_avwap_pe_backtest (
     PRIMARY KEY(study_start,study_end,trading_date,symbol)
 );
 
-CREATE TABLE IF NOT EXISTS public.weak_demand_5m_avwap_pe_summary (
+CREATE TABLE IF NOT EXISTS public.weak_demand_5m_0920_low_day_high_summary (
     study_start DATE NOT NULL,
     study_end DATE NOT NULL,
     run_id UUID NOT NULL,
@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS public.weak_demand_5m_avwap_pe_summary (
 """
 
 UPSERT = """
-INSERT INTO public.weak_demand_5m_avwap_pe_backtest (
+INSERT INTO public.weak_demand_5m_0920_low_day_high_backtest (
  study_start,study_end,run_id,trading_date,symbol,spot_instrument_key,
  day_open,atr20,prev_close,sigma,weak_demand_low,weak_demand_high,strong_demand_low,strong_demand_high,
  first5_open,first5_high,first5_low,first5_close,weak_demand_broken_5m,break_pct,
@@ -405,11 +405,14 @@ def process(sym,key,day):
     z=blank(sym,key,day)
     spot=fetch_1m(key,day)
     market=[r for r in spot if dtime(9,15)<=r["ts"].time().replace(tzinfo=None)<dtime(15,30)]
-    if not market: raise ValueError("no spot 1m history")
+    if not market:
+        raise ValueError("no spot 1m history")
 
     daily=fetch_daily(key,day-timedelta(days=1))
     prev=[r for r in daily if r["day"]<day]
-    if len(prev)<ATR_PERIOD+1: raise ValueError("insufficient daily history")
+    if len(prev)<ATR_PERIOD+1:
+        raise ValueError("insufficient daily history")
+
     atr=wilder_atr(prev,ATR_PERIOD)
     prev_close=prev[-1]["close"]
     day_open=market[0]["open"]
@@ -419,126 +422,82 @@ def process(sym,key,day):
              strong_demand_low=sdl,strong_demand_high=sdh)
 
     first5=[r for r in market if dtime(9,15)<=r["ts"].time().replace(tzinfo=None)<FIRST5_END]
-    if len(first5)<1:
+    if not first5:
         return z
-    f5o=first5[0]["open"]; f5h=max(r["high"] for r in first5); f5l=min(r["low"] for r in first5); f5c=first5[-1]["close"]
+
+    f5o=first5[0]["open"]
+    f5h=max(r["high"] for r in first5)
+    f5l=min(r["low"] for r in first5)
+    f5c=first5[-1]["close"]
     broken=f5c < wdl
+
     z.update(first5_open=f5o,first5_high=f5h,first5_low=f5l,first5_close=f5c,
-             weak_demand_broken_5m=broken,break_pct=(f5c/wdl-1)*100 if wdl else None)
+             weak_demand_broken_5m=broken,
+             break_pct=(f5c/wdl-1)*100 if wdl else None)
+
     if not broken:
         return z
 
-    bars=calc_avwap(build_3m(market))
-    if not bars: return z
-    z["anchor_0915_high"]=bars[0]["high"]
-    first5_end=datetime.combine(day,FIRST5_END,IST)
-    av_to_first5=[b for b in bars if b["end"]<=first5_end]
-    if av_to_first5:
-        z["avwap_at_1015"]=av_to_first5[-1]["avwap"]  # legacy column; now stores AVWAP at 09:20
+    entry_time=datetime.combine(day,FIRST5_END,IST)
 
-    retrace=None; entry=None
-    cutoff=datetime.combine(day,ENTRY_CUTOFF,IST)
-    for b in bars:
-        if b["end"]<=first5_end: continue
-        if b["end"]>cutoff: break
-        if retrace is None and b["high"]>=b["avwap"]:
-            retrace=b
-            z.update(retrace_found=True,retrace_time=b["end"],retrace_high=b["high"],avwap_at_retrace=b["avwap"])
-            continue
-        if retrace is not None and b["end"]>retrace["end"] and b["close"]<b["avwap"]:
-            entry=b
-            break
-    if entry is None:
-        return z
+    # User rule: once the completed 09:15-09:20 candle closes below Weak Demand,
+    # use that same 5-minute candle's LOW as the short entry reference.
+    entry_price=f5l
+    target=entry_price*(1-TARGET_PCT/100.0)
 
-    spot_entry_time=entry["end"]; spot_entry_price=entry["close"]
-    # Coming from above, the first price of the Strong Demand zone is its HIGH boundary.
-    target=float(sdh)
-    stop=spot_entry_price*(1+STOP_PCT/100)
+    # Stop = session/day high known at the 09:20 signal time.
+    # Since the trade is entered immediately after the completed 09:15-09:20 candle,
+    # this is the high of that completed opening 5-minute candle (no future leakage).
+    stop=f5h
 
-    # Only keep structurally valid bearish setups where Strong Demand is below entry.
-    if target >= spot_entry_price:
-        return z
+    z.update(
+        spot_entry_found=True,
+        spot_entry_time=entry_time,
+        spot_entry_price=entry_price,
+        spot_target_price=target,
+        spot_stop_price=stop,
+        final_trade=True,
+        time_filter_pass=True,
+        premium_filter_pass=True,
+    )
 
-    z.update(spot_entry_found=True,spot_entry_time=spot_entry_time,spot_entry_price=spot_entry_price,
-             avwap_at_entry=entry["avwap"],spot_target_price=target,spot_stop_price=stop)
+    post=[r for r in market if r["ts"]>=entry_time]
+    outcome="NEITHER"
+    outcome_time=None
+    exit_px=None
 
-    expiry,pair=pick_atm_pair(key,day,spot_entry_price)
-    ce=option_1m(pair["CE"],day); pe=option_1m(pair["PE"],day)
-    z.update(atm_strike=pair["PE"]["strike"],option_expiry=expiry,
-             pe_instrument_key=pair["PE"]["key"],ce_instrument_key=pair["CE"]["key"])
-    ce_post=[r for r in ce if r["ts"]>=spot_entry_time]
-    pe_post=[r for r in pe if r["ts"]>=spot_entry_time]
-    if not ce_post or not pe_post: raise ValueError("option history missing after spot entry")
-
-    ce0,pe0=ce_post[0],pe_post[0]
-    option_entry=None
-    for minute in range(0,OPTION_SCORE_WINDOW_MIN+1):
-        t=spot_entry_time+timedelta(minutes=minute)
-        cr=nearest_row([r for r in ce_post if r["ts"]<=t],t)
-        pr=nearest_row([r for r in pe_post if r["ts"]<=t],t)
-        if not cr or not pr: continue
-        score=sum([
-            pr["close"]>pe0["close"],  # PE premium up
-            pr["oi"]<pe0["oi"],        # PE OI down
-            cr["close"]<ce0["close"],  # CE premium down
-            cr["oi"]>ce0["oi"],        # CE OI up
-        ])
-        # Exact score 3 only. Do NOT accept score 4.
-        if score==OPTION_SCORE_REQUIRED:
-            option_entry=(max(cr["ts"],pr["ts"]),score,cr,pr)
-            break
-    if option_entry is None:
-        return z
-
-    ot,score,cr,pr=option_entry
-    z["score3_found"]=True
-    z["raw_option_entry_time"]=ot
-    z["option_entry_score"]=score
-
-    # No fixed 10:45-11:15 filter in this version.
-    # Score confirmation can occur whenever the AVWAP sequence occurs, subject only
-    # to the overall setup cutoff and the minimum PE premium.
-    time_ok = True
-    premium_ok = pr["close"] >= MIN_PE_PREMIUM
-    z["time_filter_pass"]=time_ok
-    z["premium_filter_pass"]=premium_ok
-    if not premium_ok:
-        return z
-
-    pe_entry=pr["close"]
-    z.update(final_trade=True,option_entry_time=ot,pe_entry_price=pe_entry,
-             ce_price_at_option_entry=cr["close"])
-
-    # Executable target/stop begins only after the final option entry.
-    post=[r for r in market if r["ts"]>=ot]
-    outcome="NEITHER"; outcome_time=None
     for r in post:
         hit_t=r["low"]<=target
         hit_s=r["high"]>=stop
         if hit_t and hit_s:
-            outcome="AMBIGUOUS_SAME_1M_BAR"; outcome_time=r["ts"]+timedelta(minutes=1); break
+            outcome="AMBIGUOUS_SAME_1M_BAR"
+            outcome_time=r["ts"]+timedelta(minutes=1)
+            exit_px=r["close"]
+            break
         if hit_t:
-            outcome="TARGET_FIRST"; outcome_time=r["ts"]+timedelta(minutes=1); break
+            outcome="TARGET_FIRST"
+            outcome_time=r["ts"]+timedelta(minutes=1)
+            exit_px=target
+            break
         if hit_s:
-            outcome="STOP_FIRST"; outcome_time=r["ts"]+timedelta(minutes=1); break
+            outcome="STOP_FIRST"
+            outcome_time=r["ts"]+timedelta(minutes=1)
+            exit_px=stop
+            break
 
-    pe_post_entry=[r for r in pe_post if r["ts"]>=ot]
-    if not pe_post_entry: raise ValueError("PE history missing after final entry")
-    pe_eod=pe_post_entry[-1]["close"]
-    z["pe_eod_price"]=pe_eod
-    z["pe_eod_return_pct"]=(pe_eod/pe_entry-1)*100 if pe_entry else None
+    eod=post[-1]["close"] if post else entry_price
+    if outcome=="NEITHER":
+        exit_px=eod
+
     z["first_outcome"]=outcome
     z["outcome_time"]=outcome_time
 
-    if outcome_time:
-        px=nearest_row(pe_post_entry,outcome_time)
-        if px:
-            z["pe_exit_price"]=px["close"]
-            z["pe_return_pct"]=(px["close"]/pe_entry-1)*100 if pe_entry else None
-    else:
-        z["pe_exit_price"]=pe_eod
-        z["pe_return_pct"]=z["pe_eod_return_pct"]
+    # Reuse return fields for short-SPOT strategy metrics in this study.
+    z["pe_entry_price"]=entry_price
+    z["pe_exit_price"]=exit_px
+    z["pe_return_pct"]=((entry_price-exit_px)/entry_price)*100 if exit_px is not None else None
+    z["pe_eod_price"]=eod
+    z["pe_eod_return_pct"]=((entry_price-eod)/entry_price)*100
     return z
 
 def main():
@@ -578,17 +537,16 @@ def main():
     SELECT
       COUNT(DISTINCT symbol) symbols,
       COUNT(*) FILTER(WHERE weak_demand_broken_5m) weak_demand_breaks,
-      COUNT(*) FILTER(WHERE spot_entry_found) spot_entries,
-      COUNT(*) FILTER(WHERE score3_found) score3_entries,
       COUNT(*) FILTER(WHERE final_trade) final_trades,
       COUNT(*) FILTER(WHERE final_trade AND first_outcome='TARGET_FIRST') target_first,
       COUNT(*) FILTER(WHERE final_trade AND first_outcome='STOP_FIRST') stop_first,
       COUNT(*) FILTER(WHERE final_trade AND first_outcome='NEITHER') neither,
+      COUNT(*) FILTER(WHERE final_trade AND first_outcome='AMBIGUOUS_SAME_1M_BAR') ambiguous,
       ROUND(SUM(pe_return_pct) FILTER(WHERE final_trade),2) cumulative_pct_points,
-      ROUND(AVG(pe_return_pct) FILTER(WHERE final_trade),2) avg_pe_return_pct,
+      ROUND(AVG(pe_return_pct) FILTER(WHERE final_trade),3) avg_return_pct,
       ROUND(PERCENTILE_CONT(.5) WITHIN GROUP(ORDER BY pe_return_pct)
-            FILTER(WHERE final_trade)::numeric,2) median_pe_return_pct
-    FROM public.weak_demand_5m_avwap_pe_backtest
+            FILTER(WHERE final_trade)::numeric,3) median_return_pct
+    FROM public.weak_demand_5m_0920_low_day_high_backtest
     WHERE study_start=%s AND study_end=%s
     """
     with db() as c:
@@ -605,19 +563,15 @@ def main():
 
     summary={**safe,"failed":failed,
       "rule":{
-        "zone":"Daily Weak Demand from Pine source",
-        "break":"09:15-09:20 spot close below Weak Demand Low",
-        "zone_formula":"Weak Demand and Strong Demand both mirrored from the supplied Pine daily-zone formula",
-        "avwap":"after the 09:20 break, retrace can happen any time; 3m high touches AVWAP, then first later 3m close below AVWAP",
-        "score":"exactly 3 only, within 15 minutes after AVWAP spot entry",
-        "option_time":"no fixed 10:45-11:15 filter",
-        "min_pe_premium":MIN_PE_PREMIUM,
-        "target":"Daily Strong Demand HIGH boundary (first touch of Strong Demand zone from above)",
-        "stop":"spot +0.5% from AVWAP spot entry",
-        "exit":"100% ATM PE at first target/stop; neither -> EOD"
+        "zone":"Daily Weak Demand from supplied Pine source",
+        "signal":"09:15-09:20 SPOT candle closes below Weak Demand Low",
+        "entry":"short entry at LOW of completed 09:15-09:20 candle",
+        "target":"-0.5% from entry",
+        "stop":"day/session high known at 09:20 = high of completed 09:15-09:20 candle",
+        "exit":"target/stop whichever occurs first; neither -> EOD"
       }}
 
-    qs="""INSERT INTO public.weak_demand_5m_avwap_pe_summary
+    qs="""INSERT INTO public.weak_demand_5m_0920_low_day_high_summary
       (study_start,study_end,run_id,symbols,weak_demand_breaks,spot_entries,score3_entries,
        final_trades,target_first,stop_first,neither,failed,summary)
       VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
@@ -629,9 +583,11 @@ def main():
        neither=EXCLUDED.neither,failed=EXCLUDED.failed,summary=EXCLUDED.summary"""
     with db() as c:
         with c.cursor() as x:
-            x.execute(qs,(START,END,RUN_ID,s["symbols"],s["weak_demand_breaks"],s["spot_entries"],
-                          s["score3_entries"],s["final_trades"],s["target_first"],s["stop_first"],
-                          s["neither"],failed,Jsonb(summary)))
+            x.execute(qs,(
+                START,END,RUN_ID,s["symbols"],s["weak_demand_breaks"],
+                s["final_trades"],0,s["final_trades"],
+                s["target_first"],s["stop_first"],s["neither"],failed,Jsonb(summary)
+            ))
         c.commit()
 
     log("COMPLETE")
